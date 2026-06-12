@@ -6,7 +6,7 @@ Native Swift SDK for Vestara. Zero external dependencies. Supports iOS 14+.
 
 **Swift Package Manager**
 
-Versions are resolved via Git tags. Tag a release (e.g. `git tag v0.1.0 && git push origin v0.1.0`) before referencing it below.
+Use the latest tagged release. For the first public beta, use version `0.1.0` or newer.
 
 In Xcode: File → Add Package Dependencies → enter `https://github.com/Vestara-Inc/vestara-ios`.
 
@@ -66,13 +66,19 @@ Vestara.startSession()
 
 ## What it captures automatically
 
-- Unhandled Swift exceptions (fatal errors)
-- Objective-C NSExceptions
-- Signal-based crashes (SIGSEGV, SIGABRT, etc.)
-- Main-thread ANR watchdog (5s threshold, 10s startup grace)
+Vestara can automatically capture various events depending on platform availability and configuration:
+
+- Signal-based crashes such as `SIGSEGV` and `SIGABRT`
+- Objective-C `NSException` capture where available
+- Main-thread ANR/freeze watchdog signals
 - App lifecycle breadcrumbs (foreground/background)
-- Network connectivity change breadcrumbs
-- Automatic breadcrumb attachment to crash payloads
+- Network connectivity breadcrumbs
+- Recent breadcrumbs attached to crash payloads
+- Mobile RUM metrics if enabled/configured
+- Runtime target metadata when configured
+
+> [!IMPORTANT]
+> **Privacy Note:** Vestara does not intentionally collect passwords, payment data, or full request bodies. Use `beforeSend` to redact or drop sensitive fields before events are queued. Developers should avoid sending secrets, tokens, passwords, payment data, or unnecessary personal data.
 
 ## Configuration
 
@@ -163,7 +169,6 @@ Do not set `apiURL` for normal Vestara SaaS usage.
 The package includes a `SampleApp` executable target demonstrating SDK integration:
 
 ```bash
-cd packages/sdk-ios
 swift run SampleApp
 ```
 

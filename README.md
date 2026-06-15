@@ -29,21 +29,31 @@ import VestaraSDK
 struct MyApp: App {
     init() {
         Vestara.configure(
-            token: "YOUR_SDK_TOKEN",
+            token: "<VESTARA_SDK_TOKEN>",
+            apiURL: URL(string: "https://api.vestara.dev"),
             environment: "production",
             targetCategory: "ios_app",
-            serviceName: "iOS App"
+            serviceName: "iOS App",
+            appIdentifier: Bundle.main.bundleIdentifier ?? "ios-app"
         )
+        
+        // Identify user (if applicable)
+        Vestara.setUser(id: "user-123", email: "user@example.com")
+        
+        // Log events
+        Vestara.log(.info, "User tapped checkout button")
+        Vestara.log(.error, "Payment failed: insufficient funds")
+        
+        // Trigger test crash
+        // Warning: Throwing a fatalError will crash the app. Remove before deploying to production.
+        // fatalError("Simulated iOS SDK crash")
     }
 }
 ```
 
-## Runtime target metadata
-
-You can provide metadata to identify this application in the dashboard:
-- `targetCategory`: The kind of target (e.g., `ios_app`).
-- `serviceName`: Human-readable name (e.g., `iOS App`).
-- `appIdentifier`: Optional technical identifier (defaults to `Bundle.main.bundleIdentifier` if omitted).
+## Dashboard Verification
+1. Perform the test action or crash.
+2. Check your Vestara dashboard to confirm logs, crashes, and Failure Trails appear.
 
 ## Usage
 
@@ -53,7 +63,7 @@ Vestara.log(.info, "User tapped checkout button")
 Vestara.log(.error, "Payment failed: insufficient funds")
 
 // Capture error with context
-Vestara.captureError(error, context: ["operation": "checkout"])
+// Vestara.captureError(error, context: ["operation": "checkout"])
 
 // Set user
 Vestara.setUser(id: "user-123", email: "user@example.com")

@@ -167,7 +167,7 @@ final class CrashHandler {
   }
 
   private static func installSignalHandlers() {
-    [SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV].forEach { signalCode in
+    [SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP].forEach { signalCode in
       signal(signalCode, logFlowSignalHandler)
     }
   }

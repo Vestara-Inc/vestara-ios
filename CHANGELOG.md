@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Fix crash capture for Swift `fatalError()` / `SIGTRAP` crashes by registering `SIGTRAP` in the crash handler.
+
 ## 0.1.0
 
 - Initial beta SDK package.

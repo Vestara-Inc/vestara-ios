@@ -12,7 +12,7 @@ public enum LogLevel: String {
 }
 
 public enum Vestara {
-  private static let sdkVersion = "0.1.0"
+  private static let sdkVersion = "0.1.2"
   private static let defaultAPIURL = URL(string: "https://api.vestara.dev")!
   private static let accessQueue = DispatchQueue(label: "com.vestara.state")
   private static var queue: EventQueue?
@@ -27,6 +27,7 @@ public enum Vestara {
   private static var serviceName: String?
   private static var appIdentifier: String?
   private static var loggingEnabled = true
+  private static var autoRumEnabled = true
   private static var user: [String: String] = [:]
   private static var configureSystemUptime: Double = 0
   private static var settingsTimer: DispatchSourceTimer?
@@ -41,6 +42,7 @@ public enum Vestara {
     targetCategory: String? = nil,
     serviceName: String? = nil,
     appIdentifier: String? = nil,
+    autoRum: Bool = true,
     beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil
   ) {
     accessQueue.sync {
@@ -73,6 +75,7 @@ public enum Vestara {
       Self.serviceName = serviceName
       Self.appIdentifier = appIdentifier ?? Bundle.main.bundleIdentifier
       Self.loggingEnabled = true
+      Self.autoRumEnabled = autoRum
       Self.configured = true
       Self.beforeSend = beforeSend
       Self.configureSystemUptime = ProcessInfo.processInfo.systemUptime
@@ -93,7 +96,10 @@ public enum Vestara {
         appVersion: nextDeviceInfo.appVersion,
         osVersion: nextDeviceInfo.osVersion,
         deviceModel: nextDeviceInfo.deviceModel,
-        sdkVersion: sdkVersion
+        sdkVersion: sdkVersion,
+        targetCategory: targetCategory ?? "ios_app",
+        appIdentifier: appIdentifier ?? Bundle.main.bundleIdentifier,
+        serviceName: serviceName
       )
 
       nextCrashHandler.install(context: context)
@@ -103,6 +109,10 @@ public enum Vestara {
       bindLifecycleObservers()
       startSettingsPolling()
       pollDeviceSettings()
+    }
+
+    if autoRum {
+      Self.reportAppStart()
     }
   }
 
@@ -402,6 +412,10 @@ public enum Vestara {
         pollDeviceSettings()
         uploader?.flushQueuedEvents()
         mainThreadWatchdog?.start()
+
+        if autoRumEnabled {
+          trackRumMetric(.appForeground, value: 0.0)
+        }
       }
     }
 
@@ -415,6 +429,10 @@ public enum Vestara {
         crashHandler?.updateBreadcrumbSnapshot(breadcrumbBuffer?.snapshot ?? "")
         stopSettingsPolling()
         mainThreadWatchdog?.stop()
+
+        if autoRumEnabled {
+          trackRumMetric(.appBackground, value: 0.0)
+        }
       }
     }
 #endif

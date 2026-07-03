@@ -10,6 +10,9 @@ final class CrashHandler {
     let osVersion: String
     let deviceModel: String
     let sdkVersion: String
+    let targetCategory: String
+    let appIdentifier: String?
+    let serviceName: String?
   }
 
   struct PendingCrash {
@@ -26,7 +29,10 @@ final class CrashHandler {
     appVersion: "unknown",
     osVersion: "unknown",
     deviceModel: "iPhone",
-    sdkVersion: "0.0.0"
+    sdkVersion: "0.0.0",
+    targetCategory: "ios_app",
+    appIdentifier: nil,
+    serviceName: nil
   )
   private static var user: [String: String] = [:]
   private static var breadcrumbSnapshot: String = ""
@@ -147,7 +153,17 @@ final class CrashHandler {
       return nil
     }
 
-    return [
+    if let targetCategory = values["target_category"], !targetCategory.isEmpty {
+      payload["target_category"] = targetCategory
+    }
+    if let appIdentifier = values["app_identifier"], !appIdentifier.isEmpty {
+      payload["app_identifier"] = appIdentifier
+    }
+    if let serviceName = values["service_name"], !serviceName.isEmpty {
+      payload["service_name"] = serviceName
+    }
+
+    var baseEvent: [String: Any] = [
       "event_type": "crash",
       "session_id": sessionID,
       "device_id": deviceID,
@@ -160,6 +176,22 @@ final class CrashHandler {
       "environment": environment,
       "payload": payload,
     ]
+
+    if let targetCategory = values["target_category"], !targetCategory.isEmpty {
+      baseEvent["target_category"] = targetCategory
+    } else {
+      baseEvent["target_category"] = "ios_app"
+    }
+
+    if let appIdentifier = values["app_identifier"], !appIdentifier.isEmpty {
+      baseEvent["app_identifier"] = appIdentifier
+    }
+
+    if let serviceName = values["service_name"], !serviceName.isEmpty {
+      baseEvent["service_name"] = serviceName
+    }
+
+    return baseEvent
   }
 
   private static func installExceptionHandler() {
@@ -187,6 +219,9 @@ final class CrashHandler {
       "app_version=\(context.appVersion)",
       "os_version=\(context.osVersion)",
       "device_model=\(context.deviceModel)",
+      "target_category=\(context.targetCategory)",
+      "app_identifier=\(context.appIdentifier ?? "")",
+      "service_name=\(context.serviceName ?? "")",
       "user_id=\(user["id"] ?? "")",
       "user_email=\(user["email"] ?? "")",
       "breadcrumbs=\(breadcrumbSnapshot)",
@@ -225,6 +260,9 @@ final class CrashHandler {
       "app_version=\(context.appVersion)",
       "os_version=\(context.osVersion)",
       "device_model=\(context.deviceModel)",
+      "target_category=\(context.targetCategory)",
+      "app_identifier=\(context.appIdentifier ?? "")",
+      "service_name=\(context.serviceName ?? "")",
       "breadcrumbs=\(breadcrumbSnapshot)",
     ].joined(separator: "\n") + "\n"
 

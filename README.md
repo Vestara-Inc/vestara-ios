@@ -6,7 +6,7 @@ Native Swift SDK for Vestara. Zero external dependencies. Supports iOS 14+.
 
 **Swift Package Manager**
 
-Use the latest tagged release. For the first public beta, use version `0.1.0` or newer.
+Versions are resolved via Git tags. Tag a release (e.g. `git tag v0.1.0 && git push origin v0.1.0`) before referencing it below.
 
 In Xcode: File → Add Package Dependencies → enter `https://github.com/Vestara-Inc/vestara-ios`.
 
@@ -29,31 +29,21 @@ import VestaraSDK
 struct MyApp: App {
     init() {
         Vestara.configure(
-            token: "<VESTARA_SDK_TOKEN>",
-            apiURL: URL(string: "https://api.vestara.dev"),
+            token: "YOUR_SDK_TOKEN",
             environment: "production",
             targetCategory: "ios_app",
-            serviceName: "iOS App",
-            appIdentifier: Bundle.main.bundleIdentifier ?? "ios-app"
+            serviceName: "iOS App"
         )
-        
-        // Identify user (if applicable)
-        Vestara.setUser(id: "user-123", email: "user@example.com")
-        
-        // Log events
-        Vestara.log(.info, "User tapped checkout button")
-        Vestara.log(.error, "Payment failed: insufficient funds")
-        
-        // Trigger test crash
-        // Warning: Throwing a fatalError will crash the app. Remove before deploying to production.
-        // fatalError("Simulated iOS SDK crash")
     }
 }
 ```
 
-## Dashboard Verification
-1. Perform the test action or crash.
-2. Check your Vestara dashboard to confirm logs, crashes, and Failure Trails appear.
+## Runtime target metadata
+
+You can provide metadata to identify this application in the dashboard:
+- `targetCategory`: The kind of target (e.g., `ios_app`).
+- `serviceName`: Human-readable name (e.g., `iOS App`).
+- `appIdentifier`: Optional technical identifier (defaults to `Bundle.main.bundleIdentifier` if omitted).
 
 ## Usage
 
@@ -63,7 +53,7 @@ Vestara.log(.info, "User tapped checkout button")
 Vestara.log(.error, "Payment failed: insufficient funds")
 
 // Capture error with context
-// Vestara.captureError(error, context: ["operation": "checkout"])
+Vestara.captureError(error, context: ["operation": "checkout"])
 
 // Set user
 Vestara.setUser(id: "user-123", email: "user@example.com")
@@ -76,19 +66,13 @@ Vestara.startSession()
 
 ## What it captures automatically
 
-Vestara can automatically capture various events depending on platform availability and configuration:
-
-- Signal-based crashes such as `SIGSEGV` and `SIGABRT`
-- Objective-C `NSException` capture where available
-- Main-thread ANR/freeze watchdog signals
+- Unhandled Swift exceptions (fatal errors)
+- Objective-C NSExceptions
+- Signal-based crashes (SIGSEGV, SIGABRT, etc.)
+- Main-thread ANR watchdog (5s threshold, 10s startup grace)
 - App lifecycle breadcrumbs (foreground/background)
-- Network connectivity breadcrumbs
-- Recent breadcrumbs attached to crash payloads
-- Mobile RUM metrics if enabled/configured
-- Runtime target metadata when configured
-
-> [!IMPORTANT]
-> **Privacy Note:** Vestara does not intentionally collect passwords, payment data, or full request bodies. Use `beforeSend` to redact or drop sensitive fields before events are queued. Developers should avoid sending secrets, tokens, passwords, payment data, or unnecessary personal data.
+- Network connectivity change breadcrumbs
+- Automatic breadcrumb attachment to crash payloads
 
 ## Configuration
 
@@ -179,6 +163,7 @@ Do not set `apiURL` for normal Vestara SaaS usage.
 The package includes a `SampleApp` executable target demonstrating SDK integration:
 
 ```bash
+cd packages/sdk-ios
 swift run SampleApp
 ```
 

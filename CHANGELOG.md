@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Preserve runtime target identity fields in native crash payloads.
+- Add automatic mobile RUM lifecycle events.
+- Keep Swift `fatalError()` / `SIGTRAP` crash capture from 0.1.1.
+
 ## 0.1.1
 
 - Fix crash capture for Swift `fatalError()` / `SIGTRAP` crashes by registering `SIGTRAP` in the crash handler.

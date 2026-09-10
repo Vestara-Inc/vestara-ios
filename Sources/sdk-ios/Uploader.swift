@@ -16,13 +16,38 @@ final class Uploader {
   private var wasOnline = false
   private var monitor: AnyObject?
 
-  init(queue: EventQueue, token: String, apiURL: URL, crashHandler: CrashHandler, beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil) {
+  private let initialCrashRetryDelay: TimeInterval = 10.0
+  private let maxCrashRetryDelay: TimeInterval = 120.0
+  private var crashRetryDelay: TimeInterval = 10.0
+  private var lastCrashUploadAttempt: Date = .distantPast
+
+  static var defaultNowProvider: (() -> Date)? = nil
+  var nowProvider: () -> Date = { Date() }
+  var currentCrashRetryDelay: TimeInterval {
+    var delay: TimeInterval = 0
+    workQueue.sync {
+      delay = self.crashRetryDelay
+    }
+    return delay
+  }
+
+  init(
+    queue: EventQueue,
+    token: String,
+    apiURL: URL,
+    crashHandler: CrashHandler,
+    beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil,
+    session: URLSession? = nil
+  ) {
     self.queue = queue
     self.token = token
     self.apiURL = apiURL
     self.crashHandler = crashHandler
-    self.session = URLSession(configuration: .default)
+    self.session = session ?? URLSession(configuration: .default)
     self.beforeSend = beforeSend
+    if let defaultProvider = Uploader.defaultNowProvider {
+      self.nowProvider = defaultProvider
+    }
   }
 
   func start() {
@@ -31,12 +56,17 @@ final class Uploader {
       let nextTimer = DispatchSource.makeTimerSource(queue: self.workQueue)
       nextTimer.schedule(deadline: .now() + 10, repeating: 10)
       nextTimer.setEventHandler { [weak self] in
-        self?.flushQueuedEvents()
+        self?.performPeriodicTick()
       }
       self.timer = nextTimer
       nextTimer.resume()
       self.startNetworkMonitor()
     }
+  }
+
+  func performPeriodicTick() {
+    flushQueuedEvents()
+    uploadPendingCrashes(force: false)
   }
 
   func stop() {
@@ -64,7 +94,7 @@ final class Uploader {
           if isOnline && !previouslyOnline {
             self.workQueue.async {
               self.flushQueuedEvents()
-              self.uploadPendingCrashes()
+              self.uploadPendingCrashes(force: false)
             }
           }
         }
@@ -95,67 +125,156 @@ final class Uploader {
       }
 
       self.isUploading = true
-      self.upload(events: events) { success in
-        self.workQueue.async {
+      self.upload(events: events) { [weak self] success in
+        self?.workQueue.async {
           if success {
-            self.queue.removeFirst(events.count)
-            self.isUploading = false
+            self?.queue.removeFirst(events.count)
+            self?.isUploading = false
 
-            if self.queue.count() > 0 {
-              self.flushQueuedEvents()
+            if (self?.queue.count() ?? 0) > 0 {
+              self?.flushQueuedEvents()
             }
           } else {
-            self.isUploading = false
+            self?.isUploading = false
           }
         }
       }
     }
   }
 
-  func uploadPendingCrashes() {
+  func uploadPendingCrashes(force: Bool = false) {
     workQueue.async {
       guard !self.isUploadingCrashes else {
         return
       }
 
-      let pending = self.crashHandler.loadPendingCrashes()
-
-      guard !pending.isEmpty else {
+      let now = self.nowProvider()
+      if now.timeIntervalSince(self.lastCrashUploadAttempt) < self.crashRetryDelay {
         return
       }
 
-      var eventsToUpload: [[String: Any]] = []
-      for crash in pending {
-        if let hook = self.beforeSend {
-          do {
-            if let filtered = try hook(crash.event) {
-              eventsToUpload.append(filtered)
-            }
-          } catch {
-            eventsToUpload.append(crash.event)
-          }
-        } else {
-          eventsToUpload.append(crash.event)
-        }
-      }
-
-      guard !eventsToUpload.isEmpty else {
-        self.crashHandler.deleteCrashFiles(at: pending.map(\.fileURL))
+      let pending = self.crashHandler.loadPendingCrashes()
+      guard !pending.isEmpty else {
+        self.crashRetryDelay = self.initialCrashRetryDelay
+        self.lastCrashUploadAttempt = .distantPast
         return
       }
 
       self.isUploadingCrashes = true
+      self.lastCrashUploadAttempt = now
+      self.uploadCrashesSequentially(Array(pending), cycleHadFailure: false)
+    }
+  }
 
-      self.upload(events: eventsToUpload) { [weak self] success in
-        self?.workQueue.async {
-          self?.isUploadingCrashes = false
+  private func uploadCrashesSequentially(_ remaining: [CrashHandler.PendingCrash], cycleHadFailure: Bool) {
+    guard let nextCrash = remaining.first else {
+      self.isUploadingCrashes = false
+      if !cycleHadFailure {
+        self.crashRetryDelay = self.initialCrashRetryDelay
+        self.lastCrashUploadAttempt = .distantPast
+      }
+      return
+    }
 
-          if success {
-            self?.crashHandler.deleteCrashFiles(at: pending.map(\.fileURL))
-          }
+    var eventToUpload: [String: Any]? = nextCrash.event
+    if let hook = self.beforeSend {
+      do {
+        eventToUpload = try hook(nextCrash.event)
+      } catch {
+        eventToUpload = nextCrash.event
+      }
+    }
+
+    // Intentional drop by beforeSend hook: delete file and proceed to next.
+    guard let event = eventToUpload else {
+      self.crashHandler.deleteCrashFiles(at: [nextCrash.fileURL])
+      self.uploadCrashesSequentially(Array(remaining.dropFirst()), cycleHadFailure: cycleHadFailure)
+      return
+    }
+
+    self.uploadSingleCrashEvent(event: event) { [weak self] outcome in
+      guard let self = self else { return }
+      self.workQueue.async {
+        switch outcome {
+        case .acknowledged:
+          // Delete only when backend explicitly accepted: accepted == 1 && rejected == 0.
+          self.crashHandler.deleteCrashFiles(at: [nextCrash.fileURL])
+          self.uploadCrashesSequentially(Array(remaining.dropFirst()), cycleHadFailure: cycleHadFailure)
+
+        case .rejected:
+          // Backend returned 2xx but rejected == 1 or accepted != 1 (schema/limit rejection).
+          // Retain the file (do NOT delete), apply backoff for next retry cycle, but proceed with remaining crashes.
+          self.crashRetryDelay = min(self.crashRetryDelay * 2, self.maxCrashRetryDelay)
+          self.uploadCrashesSequentially(Array(remaining.dropFirst()), cycleHadFailure: true)
+
+        case .transportError:
+          // HTTP != 2xx, network failure, or unparseable response body.
+          // Retain the file, apply backoff, stop current upload cycle.
+          self.crashRetryDelay = min(self.crashRetryDelay * 2, self.maxCrashRetryDelay)
+          self.isUploadingCrashes = false
         }
       }
     }
+  }
+
+  enum CrashUploadOutcome {
+    case acknowledged
+    case rejected
+    case transportError
+  }
+
+  struct IngestAcknowledgement {
+    let accepted: Int
+    let rejected: Int
+  }
+
+  static func parseIngestAcknowledgement(data: Data?, response: URLResponse?, error: Error?) -> IngestAcknowledgement? {
+    guard
+      error == nil,
+      let httpResponse = response as? HTTPURLResponse,
+      (200..<300).contains(httpResponse.statusCode),
+      let data = data,
+      let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
+    else {
+      return nil
+    }
+
+    guard
+      let acceptedNumber = json["accepted"] as? NSNumber,
+      let rejectedNumber = json["rejected"] as? NSNumber
+    else {
+      return nil
+    }
+
+    return IngestAcknowledgement(accepted: acceptedNumber.intValue, rejected: rejectedNumber.intValue)
+  }
+
+  private func uploadSingleCrashEvent(event: [String: Any], completion: @escaping (CrashUploadOutcome) -> Void) {
+    let url = apiURL.appendingPathComponent("v1/ingest")
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(token, forHTTPHeaderField: "X-SDK-Token")
+
+    guard let body = try? JSONSerialization.data(withJSONObject: ["events": [event]], options: []) else {
+      completion(.transportError)
+      return
+    }
+
+    request.httpBody = body
+
+    session.dataTask(with: request) { data, response, error in
+      guard let ack = Uploader.parseIngestAcknowledgement(data: data, response: response, error: error) else {
+        completion(.transportError)
+        return
+      }
+
+      if ack.accepted == 1 && ack.rejected == 0 {
+        completion(.acknowledged)
+      } else {
+        completion(.rejected)
+      }
+    }.resume()
   }
 
   func fetchLoggingEnabled(deviceID: String, completion: @escaping (Bool?) -> Void) {
@@ -197,20 +316,30 @@ final class Uploader {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(token, forHTTPHeaderField: "X-SDK-Token")
 
-    guard let body = try? JSONSerialization.data(withJSONObject: ["events": events], options: []) else {
+    let outboundEvents: [[String: Any]] = events.map { event in
+      guard let rawEnv = event["environment"] as? String else {
+        return event
+      }
+      var copy = event
+      copy["environment"] = Vestara.normalizeEnvironment(rawEnv)
+      return copy
+    }
+
+    guard let body = try? JSONSerialization.data(withJSONObject: ["events": outboundEvents], options: []) else {
       completion(false)
       return
     }
 
     request.httpBody = body
 
-    session.dataTask(with: request) { _, response, _ in
-      guard let httpResponse = response as? HTTPURLResponse else {
+    session.dataTask(with: request) { data, response, error in
+      guard let ack = Uploader.parseIngestAcknowledgement(data: data, response: response, error: error) else {
         completion(false)
         return
       }
 
-      completion((200..<300).contains(httpResponse.statusCode))
+      let isFullyAccepted = (ack.accepted == outboundEvents.count && ack.rejected == 0)
+      completion(isFullyAccepted)
     }.resume()
   }
 }

@@ -12,7 +12,7 @@ public enum LogLevel: String {
 }
 
 public enum Vestara {
-  private static let sdkVersion = "0.1.2"
+  private static let sdkVersion = "0.1.3"
   private static let defaultAPIURL = URL(string: "https://api.vestara.dev")!
   private static let accessQueue = DispatchQueue(label: "com.vestara.state")
   private static var queue: EventQueue?
@@ -35,6 +35,21 @@ public enum Vestara {
   private static var configured = false
   private static var beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil
 
+  static func normalizeEnvironment(_ env: String) -> String {
+    let trimmed = env.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = trimmed.lowercased()
+    switch lower {
+    case "live", "production":
+      return "production"
+    case "dev", "development":
+      return "development"
+    case "staging":
+      return "staging"
+    default:
+      return trimmed
+    }
+  }
+
   public static func configure(
     token: String,
     apiURL: URL? = nil,
@@ -45,6 +60,31 @@ public enum Vestara {
     autoRum: Bool = true,
     beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil
   ) {
+    internalConfigure(
+      token: token,
+      apiURL: apiURL,
+      environment: environment,
+      targetCategory: targetCategory,
+      serviceName: serviceName,
+      appIdentifier: appIdentifier,
+      autoRum: autoRum,
+      beforeSend: beforeSend,
+      session: nil
+    )
+  }
+
+  static func internalConfigure(
+    token: String,
+    apiURL: URL? = nil,
+    environment: String = "production",
+    targetCategory: String? = nil,
+    serviceName: String? = nil,
+    appIdentifier: String? = nil,
+    autoRum: Bool = true,
+    beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil,
+    session: URLSession? = nil
+  ) {
+    let normalizedEnvironment = normalizeEnvironment(environment)
     accessQueue.sync {
       guard !token.isEmpty else {
         return
@@ -59,7 +99,8 @@ public enum Vestara {
         token: token,
         apiURL: apiURL ?? defaultAPIURL,
         crashHandler: nextCrashHandler,
-        beforeSend: beforeSend
+        beforeSend: beforeSend,
+        session: session
       )
       let nextWatchdog = MainThreadWatchdog()
 
@@ -70,7 +111,7 @@ public enum Vestara {
       Self.uploader = nextUploader
       Self.mainThreadWatchdog = nextWatchdog
       Self.sessionID = UUID().uuidString
-      Self.environment = environment
+      Self.environment = normalizedEnvironment
       Self.targetCategory = targetCategory ?? "ios_app"
       Self.serviceName = serviceName
       Self.appIdentifier = appIdentifier ?? Bundle.main.bundleIdentifier
@@ -85,14 +126,16 @@ public enum Vestara {
       }
 
       nextDeviceInfo.networkChangeCallback = { networkType in
-        Self.breadcrumbBuffer?.add(category: "network", message: "Network: \(networkType)", level: "info")
-        Self.crashHandler?.updateBreadcrumbSnapshot(Self.breadcrumbBuffer?.snapshot ?? "")
+        accessQueue.async {
+          Self.breadcrumbBuffer?.add(category: "network", message: "Network: \(networkType)", level: "info")
+          Self.crashHandler?.updateBreadcrumbSnapshot(Self.breadcrumbBuffer?.snapshot ?? "")
+        }
       }
 
       let context = CrashHandler.Context(
         sessionID: sessionID,
         deviceID: nextDeviceInfo.deviceID,
-        environment: environment,
+        environment: normalizedEnvironment,
         appVersion: nextDeviceInfo.appVersion,
         osVersion: nextDeviceInfo.osVersion,
         deviceModel: nextDeviceInfo.deviceModel,
@@ -103,7 +146,7 @@ public enum Vestara {
       )
 
       nextCrashHandler.install(context: context)
-      nextUploader.uploadPendingCrashes()
+      nextUploader.uploadPendingCrashes(force: true)
       nextUploader.start()
       nextWatchdog.start()
       bindLifecycleObservers()
@@ -393,6 +436,46 @@ public enum Vestara {
     }
   }
 
+  static func handleAppDidBecomeActive() {
+    accessQueue.async {
+      breadcrumbBuffer?.add(category: "app.lifecycle", message: "App foregrounded", level: "info")
+      crashHandler?.updateBreadcrumbSnapshot(breadcrumbBuffer?.snapshot ?? "")
+      startSettingsPolling()
+      pollDeviceSettings()
+      uploader?.flushQueuedEvents()
+      uploader?.uploadPendingCrashes(force: true)
+      mainThreadWatchdog?.start()
+
+      if autoRumEnabled {
+        trackRumMetric(.appForeground, value: 0.0)
+      }
+    }
+  }
+
+  static func resetForTesting() {
+    accessQueue.sync {
+      stopSettingsPolling()
+      uploader?.stop()
+      mainThreadWatchdog?.stop()
+      queue = nil
+      deviceInfo = nil
+      crashHandler = nil
+      breadcrumbBuffer = nil
+      uploader = nil
+      mainThreadWatchdog = nil
+      configured = false
+      loggingEnabled = true
+      autoRumEnabled = false
+      UserDefaults.standard.removeObject(forKey: "com.vestara.queue.v1")
+    }
+  }
+
+  static func flushForTesting() {
+    accessQueue.sync {
+      uploader?.flushQueuedEvents()
+    }
+  }
+
   private static func bindLifecycleObservers() {
     guard !observersBound else {
       return
@@ -405,18 +488,7 @@ public enum Vestara {
       object: nil,
       queue: nil
     ) { _ in
-      accessQueue.async {
-        breadcrumbBuffer?.add(category: "app.lifecycle", message: "App foregrounded", level: "info")
-        crashHandler?.updateBreadcrumbSnapshot(breadcrumbBuffer?.snapshot ?? "")
-        startSettingsPolling()
-        pollDeviceSettings()
-        uploader?.flushQueuedEvents()
-        mainThreadWatchdog?.start()
-
-        if autoRumEnabled {
-          trackRumMetric(.appForeground, value: 0.0)
-        }
-      }
+      Self.handleAppDidBecomeActive()
     }
 
     NotificationCenter.default.addObserver(

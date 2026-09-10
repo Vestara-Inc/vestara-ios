@@ -21,7 +21,7 @@ final class CrashHandler {
   }
 
   private static let directoryName = "VestaraCrashes"
-  private static let signalFileName = "pending-signal.crash"
+  private static let contextLock = NSLock()
   private static var context = Context(
     sessionID: "",
     deviceID: "",
@@ -51,14 +51,18 @@ final class CrashHandler {
   }
 
   func updateUser(id: String, email: String?) {
+    CrashHandler.contextLock.lock()
     CrashHandler.user = [
       "id": id,
       "email": email ?? "",
     ]
+    CrashHandler.contextLock.unlock()
   }
 
   func updateBreadcrumbSnapshot(_ snapshot: String) {
+    CrashHandler.contextLock.lock()
     CrashHandler.breadcrumbSnapshot = snapshot
+    CrashHandler.contextLock.unlock()
   }
 
   func loadPendingCrashes() -> [PendingCrash] {
@@ -71,7 +75,18 @@ final class CrashHandler {
       return []
     }
 
-    return fileURLs.compactMap { fileURL in
+    let sortedURLs = fileURLs
+      .filter { $0.pathExtension == "crash" }
+      .sorted { u1, u2 in
+        let d1 = (try? u1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+        let d2 = (try? u2.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+        if d1 == d2 {
+          return u1.lastPathComponent < u2.lastPathComponent
+        }
+        return d1 < d2
+      }
+
+    return sortedURLs.compactMap { fileURL in
       guard let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
         return nil
       }
@@ -136,7 +151,7 @@ final class CrashHandler {
           "category": $0.category,
           "message": $0.message,
           "level": $0.level,
-          "data": $0.data,
+          "data": $0.data as Any,
         ]}
       }
     }
@@ -144,7 +159,7 @@ final class CrashHandler {
     guard
       let sessionID = values["session_id"],
       let deviceID = values["device_id"],
-      let environment = values["environment"],
+      let rawEnvironment = values["environment"],
       let sdkVersion = values["sdk_version"],
       let appVersion = values["app_version"],
       let osVersion = values["os_version"],
@@ -152,6 +167,8 @@ final class CrashHandler {
     else {
       return nil
     }
+
+    let environment = Vestara.normalizeEnvironment(rawEnvironment)
 
     if let targetCategory = values["target_category"], !targetCategory.isEmpty {
       payload["target_category"] = targetCategory
@@ -207,6 +224,12 @@ final class CrashHandler {
   private static func persistException(_ exception: NSException) {
     let fileURL = crashDirectoryURL().appendingPathComponent("pending-exception-\(UUID().uuidString).crash")
     let stack = exception.callStackSymbols.joined(separator: "\n").replacingOccurrences(of: "\n", with: "\\n")
+
+    CrashHandler.contextLock.lock()
+    let currentBreadcrumbs = breadcrumbSnapshot
+    let currentUser = user
+    CrashHandler.contextLock.unlock()
+
     let message = [
       "type=exception",
       "name=\(exception.name.rawValue)",
@@ -222,9 +245,9 @@ final class CrashHandler {
       "target_category=\(context.targetCategory)",
       "app_identifier=\(context.appIdentifier ?? "")",
       "service_name=\(context.serviceName ?? "")",
-      "user_id=\(user["id"] ?? "")",
-      "user_email=\(user["email"] ?? "")",
-      "breadcrumbs=\(breadcrumbSnapshot)",
+      "user_id=\(currentUser["id"] ?? "")",
+      "user_email=\(currentUser["email"] ?? "")",
+      "breadcrumbs=\(currentBreadcrumbs)",
     ].joined(separator: "\n")
 
     try? message.data(using: .utf8)?.write(to: fileURL, options: .atomic)
@@ -234,8 +257,9 @@ final class CrashHandler {
     persistException(exception)
   }
 
-  private static func prepareSignalContext() {
-    let path = crashDirectoryURL().appendingPathComponent(signalFileName).path
+  static func prepareSignalContext(uniqueFileName: String? = nil) {
+    let fileName = uniqueFileName ?? "pending-signal-\(UUID().uuidString).crash"
+    let path = crashDirectoryURL().appendingPathComponent(fileName).path
 
     var pathCStr = [CChar](repeating: 0, count: 1024)
     var pathIdx = 0
@@ -251,6 +275,10 @@ final class CrashHandler {
       signalPath[i] = i < pathCStr.count ? pathCStr[i] : 0
     }
 
+    CrashHandler.contextLock.lock()
+    let currentBreadcrumbs = breadcrumbSnapshot
+    CrashHandler.contextLock.unlock()
+
     let base = [
       "type=signal",
       "session_id=\(context.sessionID)",
@@ -263,7 +291,7 @@ final class CrashHandler {
       "target_category=\(context.targetCategory)",
       "app_identifier=\(context.appIdentifier ?? "")",
       "service_name=\(context.serviceName ?? "")",
-      "breadcrumbs=\(breadcrumbSnapshot)",
+      "breadcrumbs=\(currentBreadcrumbs)",
     ].joined(separator: "\n") + "\n"
 
     let baseBytes = Array(base.utf8)
@@ -273,7 +301,13 @@ final class CrashHandler {
     }
   }
 
+  static var customCrashDirectoryURL: URL? = nil
+
   static func crashDirectoryURL() -> URL {
+    if let custom = customCrashDirectoryURL {
+      try? FileManager.default.createDirectory(at: custom, withIntermediateDirectories: true)
+      return custom
+    }
     let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
       ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
     let directory = base.appendingPathComponent(directoryName, isDirectory: true)
@@ -319,23 +353,6 @@ final class CrashHandler {
     digits.withUnsafeBufferPointer { buffer in
       guard let baseAddress = buffer.baseAddress else { return }
       _ = write(fileDescriptor, baseAddress.advanced(by: index), buffer.count - index)
-    }
-
-    newline.withUnsafeBufferPointer { buffer in
-      guard let baseAddress = buffer.baseAddress else { return }
-      _ = write(fileDescriptor, baseAddress, buffer.count)
-    }
-
-    let breadcrumbsKey = Array("breadcrumbs=".utf8)
-    breadcrumbsKey.withUnsafeBufferPointer { buffer in
-      guard let baseAddress = buffer.baseAddress else { return }
-      _ = write(fileDescriptor, baseAddress, buffer.count)
-    }
-
-    let breadcrumbsValue = Array(breadcrumbSnapshot.utf8)
-    breadcrumbsValue.withUnsafeBufferPointer { buffer in
-      guard let baseAddress = buffer.baseAddress else { return }
-      _ = write(fileDescriptor, baseAddress, buffer.count)
     }
 
     newline.withUnsafeBufferPointer { buffer in

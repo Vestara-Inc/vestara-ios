@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3
+
+- Fixed persisted crash reports becoming stranded after transient upload failures.
+- Added periodic and foreground crash retry with bounded backoff.
+- Prevented later signal crashes from overwriting earlier unacknowledged crash reports.
+- Crash reports are now deleted only after explicit backend acceptance.
+- Regular queued telemetry now validates ingest acknowledgement before removal.
+- Existing and new `live` environments normalize to `production`.
+- Existing and new `dev` environments normalize to `development`.
+- Improved crash-context synchronization.
+- Added regression coverage for crash persistence, retries, backend rejection, queue acknowledgement, and environment normalization.
+
 ## 0.1.2
 
 - Preserve runtime target identity fields in native crash payloads.

@@ -1,5 +1,8 @@
 import Foundation
 import Darwin
+#if canImport(VestaraCSignalState)
+@_implementationOnly import VestaraCSignalState
+#endif
 
 final class CrashHandler {
   struct Context {
@@ -45,6 +48,7 @@ final class CrashHandler {
 
   func install(context: Context) {
     CrashHandler.context = context
+    vestara_signal_state_reset()
     CrashHandler.prepareSignalContext()
     CrashHandler.installExceptionHandler()
     CrashHandler.installSignalHandlers()
@@ -59,10 +63,153 @@ final class CrashHandler {
     CrashHandler.contextLock.unlock()
   }
 
+  func clearUser() {
+    CrashHandler.contextLock.lock()
+    CrashHandler.user = [:]
+    CrashHandler.contextLock.unlock()
+  }
+
   func updateBreadcrumbSnapshot(_ snapshot: String) {
     CrashHandler.contextLock.lock()
     CrashHandler.breadcrumbSnapshot = snapshot
     CrashHandler.contextLock.unlock()
+  }
+
+  /**
+   * Synchronously stages a fatal React Native JavaScript crash to disk as a pending .crash file.
+   * Uses authoritative native context, bounds error strings, and writes atomically.
+   * Returns true only on successful persistence; returns false if context is missing or write fails.
+   */
+  func stageFatal(
+    crashId: String,
+    message: String,
+    errorType: String?,
+    stack: String?,
+    jsBreadcrumbsJson: String?
+  ) -> Bool {
+    guard !CrashHandler.context.sessionID.isEmpty && !CrashHandler.context.deviceID.isEmpty else {
+      return false
+    }
+
+    let boundedMessage = message.count > 8192 ? String(message.prefix(8192)) + " [truncated]" : (message.isEmpty ? "Fatal React Native JS error" : message)
+    let boundedErrorType = (errorType?.isEmpty ?? true) ? "ReactNativeFatalError" : String(errorType!.prefix(256))
+    let boundedStack = (stack?.count ?? 0) > 32768 ? String(stack!.prefix(32768)) : (stack ?? "")
+
+    CrashHandler.contextLock.lock()
+    let rawBreadcrumbs = jsBreadcrumbsJson ?? CrashHandler.breadcrumbSnapshot
+    let currentUser = CrashHandler.user
+    CrashHandler.contextLock.unlock()
+
+    let validBreadcrumbs: String
+    if let jsCrumbs = jsBreadcrumbsJson {
+      if !jsCrumbs.isEmpty && jsCrumbs.utf8.count <= 16 * 1024 {
+        validBreadcrumbs = jsCrumbs
+      } else {
+        validBreadcrumbs = ""
+      }
+    } else {
+      if !rawBreadcrumbs.isEmpty && rawBreadcrumbs.utf8.count <= 16 * 1024 {
+        validBreadcrumbs = rawBreadcrumbs
+      } else {
+        validBreadcrumbs = ""
+      }
+    }
+
+    let fileURL = CrashHandler.crashDirectoryURL().appendingPathComponent("pending-rn-\(crashId).crash")
+
+    let escapedMessage = CrashHandler.escapeValue(boundedMessage)
+    let escapedStack = CrashHandler.escapeValue(boundedStack)
+    let escapedType = CrashHandler.escapeValue(boundedErrorType)
+    let rnMessageB64 = Data(boundedMessage.utf8).base64EncodedString()
+    let rnStackB64 = Data(boundedStack.utf8).base64EncodedString()
+
+    let contentLines = [
+      "type=react_native_js",
+      "origin=react_native_js",
+      "crash_id=\(crashId)",
+      "name=\(escapedType)",
+      "message=\(escapedMessage)",
+      "stack=\(escapedStack)",
+      "rn_message_b64=\(rnMessageB64)",
+      "rn_stack_b64=\(rnStackB64)",
+      "session_id=\(CrashHandler.context.sessionID)",
+      "device_id=\(CrashHandler.context.deviceID)",
+      "environment=\(CrashHandler.context.environment)",
+      "sdk_version=\(CrashHandler.context.sdkVersion)",
+      "app_version=\(CrashHandler.context.appVersion)",
+      "os_version=\(CrashHandler.context.osVersion)",
+      "device_model=\(CrashHandler.context.deviceModel)",
+      "target_category=\(CrashHandler.context.targetCategory)",
+      "app_identifier=\(CrashHandler.context.appIdentifier ?? "")",
+      "service_name=\(CrashHandler.context.serviceName ?? "")",
+      "user_id=\(currentUser["id"] ?? "")",
+      "user_email=\(currentUser["email"] ?? "")",
+      "breadcrumbs=\(validBreadcrumbs)",
+    ]
+    let messageText = contentLines.joined(separator: "\n")
+
+    guard let data = messageText.data(using: .utf8) else {
+      return false
+    }
+
+    do {
+      try data.write(to: fileURL, options: .atomic)
+      vestara_signal_state_arm_exception()
+      return true
+    } catch {
+      try? FileManager.default.removeItem(at: fileURL)
+      return false
+    }
+  }
+
+  static func escapeValue(_ value: String) -> String {
+    return value
+      .replacingOccurrences(of: "\r\n", with: "\n")
+      .replacingOccurrences(of: "\r", with: "\n")
+      .replacingOccurrences(of: "\n", with: "\\n")
+  }
+
+  static func parseJsStack(_ stack: String) -> [[String: Any]] {
+    guard !stack.isEmpty else { return [] }
+    var frames: [[String: Any]] = []
+    let lines = stack.split(separator: "\n")
+    for rawLine in lines {
+      if frames.count >= 50 { break }
+      let line = rawLine.trimmingCharacters(in: .whitespaces)
+      if line.isEmpty { continue }
+
+      if let openParen = line.range(of: " ("), let closeParen = line.range(of: ")", options: .backwards, range: openParen.upperBound..<line.endIndex) {
+        let funcPart = String(line[line.startIndex..<openParen.lowerBound]).replacingOccurrences(of: "at ", with: "").trimmingCharacters(in: .whitespaces)
+        let location = String(line[openParen.upperBound..<closeParen.lowerBound])
+        let locParts = location.split(separator: ":")
+        let file = locParts.count > 0 ? String(locParts[0]) : "unknown"
+        let lineNum = locParts.count > 1 ? (Int(locParts[1]) ?? 0) : 0
+        frames.append(["function": funcPart.isEmpty ? "anonymous" : funcPart, "file": file, "line": lineNum])
+        continue
+      }
+
+      if line.hasPrefix("at ") {
+        let location = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+        let locParts = location.split(separator: ":")
+        let file = locParts.count > 0 ? String(locParts[0]) : "unknown"
+        let lineNum = locParts.count > 1 ? (Int(locParts[1]) ?? 0) : 0
+        frames.append(["function": "anonymous", "file": file, "line": lineNum])
+        continue
+      }
+
+      if let atRange = line.range(of: "@") {
+        let funcPart = String(line[line.startIndex..<atRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+        let location = String(line[atRange.upperBound...])
+        let locParts = location.split(separator: ":")
+        let file = locParts.count > 0 ? String(locParts[0]) : "unknown"
+        let lineNum = locParts.count > 1 ? (Int(locParts[1]) ?? 0) : 0
+        frames.append(["function": funcPart.isEmpty ? "anonymous" : funcPart, "file": file, "line": lineNum])
+        continue
+      }
+
+      frames.append(["function": line, "file": "unknown", "line": 0])
+    }
+    return frames
   }
 
   func loadPendingCrashes() -> [PendingCrash] {
@@ -144,15 +291,18 @@ final class CrashHandler {
     }
 
     if let breadcrumbsJSON = values["breadcrumbs"], !breadcrumbsJSON.isEmpty {
-      if let data = breadcrumbsJSON.data(using: .utf8),
-         let breadcrumbs = try? JSONDecoder().decode([Breadcrumb].self, from: data) {
-        payload["breadcrumbs"] = breadcrumbs.map { [
-          "timestamp": $0.timestamp,
-          "category": $0.category,
-          "message": $0.message,
-          "level": $0.level,
-          "data": $0.data as Any,
-        ]}
+      if let data = breadcrumbsJSON.data(using: .utf8) {
+        if let breadcrumbs = try? JSONDecoder().decode([Breadcrumb].self, from: data) {
+          payload["breadcrumbs"] = breadcrumbs.map { [
+            "timestamp": $0.timestamp,
+            "category": $0.category,
+            "message": $0.message,
+            "level": $0.level,
+            "data": $0.data as Any,
+          ]}
+        } else if let genericArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+          payload["breadcrumbs"] = genericArray
+        }
       }
     }
 
@@ -178,6 +328,34 @@ final class CrashHandler {
     }
     if let serviceName = values["service_name"], !serviceName.isEmpty {
       payload["service_name"] = serviceName
+    }
+    if let origin = values["origin"], !origin.isEmpty {
+      payload["origin"] = origin
+    }
+    if let crashId = values["crash_id"], !crashId.isEmpty {
+      payload["crash_id"] = crashId
+    }
+    if values["type"] == "react_native_js" {
+      payload["fatal"] = true
+      payload["handled"] = false
+
+      if let b64Msg = values["rn_message_b64"],
+         let data = Data(base64Encoded: b64Msg),
+         let decodedMsg = String(data: data, encoding: .utf8) {
+        payload["message"] = decodedMsg
+      }
+
+      var jsStack = values["stack"] ?? ""
+      if let b64Stack = values["rn_stack_b64"],
+         let data = Data(base64Encoded: b64Stack),
+         let decodedStack = String(data: data, encoding: .utf8) {
+        jsStack = decodedStack
+        payload["stack"] = decodedStack
+      }
+
+      if !jsStack.isEmpty {
+        payload["stack_trace"] = parseJsStack(jsStack)
+      }
     }
 
     var baseEvent: [String: Any] = [
@@ -254,7 +432,36 @@ final class CrashHandler {
   }
 
   static func handleException(_ exception: NSException) {
+    if handleExceptionSuppression(exception) {
+      return
+    }
     persistException(exception)
+  }
+
+  internal static func handleExceptionSuppression(_ exception: NSException) -> Bool {
+    if exception.name.rawValue.hasPrefix("RCTFatalException") {
+      if vestara_signal_state_consume_exception() {
+        vestara_signal_state_arm_sigabrt()
+        return true
+      }
+    }
+    return false
+  }
+
+  internal static func consumeSignalSuppression(_ signalCode: Int32) -> Bool {
+    return vestara_signal_state_consume_sigabrt(signalCode)
+  }
+
+  internal static func resetSuppressionTokensForTest() {
+    vestara_signal_state_reset()
+  }
+
+  internal static func isFatalExceptionSuppressionArmedForTest() -> Bool {
+    return vestara_signal_state_is_exception_armed()
+  }
+
+  internal static func isSignalSuppressionArmedForTest() -> Bool {
+    return vestara_signal_state_is_sigabrt_armed()
   }
 
   static func prepareSignalContext(uniqueFileName: String? = nil) {
@@ -365,6 +572,11 @@ final class CrashHandler {
 }
 
 private func logFlowSignalHandler(_ signalCode: Int32) -> Void {
+  if vestara_signal_state_consume_sigabrt(signalCode) {
+    signal(signalCode, SIG_DFL)
+    raise(signalCode)
+    return
+  }
   CrashHandler.persistSignal(signalCode)
   signal(signalCode, SIG_DFL)
   raise(signalCode)

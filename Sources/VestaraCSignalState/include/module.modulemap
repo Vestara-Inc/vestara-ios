@@ -1,0 +1,4 @@
+module VestaraCSignalState {
+    header "VestaraCSignalState.h"
+    export *
+}

@@ -15,7 +15,12 @@ let package = Package(
   ],
   targets: [
     .target(
+      name: "VestaraCSignalState",
+      path: "Sources/VestaraCSignalState"
+    ),
+    .target(
       name: "VestaraSDK",
+      dependencies: ["VestaraCSignalState"],
       path: "Sources/sdk-ios"
     ),
     .executableTarget(
@@ -25,7 +30,7 @@ let package = Package(
     ),
     .testTarget(
       name: "VestaraSDKTests",
-      dependencies: ["VestaraSDK"],
+      dependencies: ["VestaraSDK", "VestaraCSignalState"],
       path: "Tests/sdk-ios"
     ),
   ]

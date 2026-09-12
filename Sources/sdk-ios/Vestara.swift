@@ -11,10 +11,26 @@ public enum LogLevel: String {
   case fatal
 }
 
+/// Integration support context providing read-only access to runtime identity.
+public struct RuntimeContext: Equatable {
+  public let sessionID: String
+  public let deviceID: String
+
+  public init(sessionID: String, deviceID: String) {
+    self.sessionID = sessionID
+    self.deviceID = deviceID
+  }
+}
+
 public enum Vestara {
-  private static let sdkVersion = "0.1.3"
+  private static let sdkVersion = "0.1.4"
   private static let defaultAPIURL = URL(string: "https://api.vestara.dev")!
-  private static let accessQueue = DispatchQueue(label: "com.vestara.state")
+  private static let accessQueueKey = DispatchSpecificKey<Void>()
+  private static let accessQueue: DispatchQueue = {
+    let queue = DispatchQueue(label: "com.vestara.state")
+    queue.setSpecific(key: accessQueueKey, value: ())
+    return queue
+  }()
   private static var queue: EventQueue?
   private static var uploader: Uploader?
   private static var deviceInfo: DeviceInfo?
@@ -216,6 +232,63 @@ public enum Vestara {
 
       sessionID = UUID().uuidString
       breadcrumbBuffer?.clear()
+    }
+  }
+
+  /// Clears user context for future log and crash payloads.
+  public static func clearUser() {
+    let performClear = {
+      guard configured else {
+        return
+      }
+      user = [:]
+      crashHandler?.clearUser()
+    }
+
+    if DispatchQueue.getSpecific(key: accessQueueKey) != nil {
+      performClear()
+    } else {
+      accessQueue.sync(execute: performClear)
+    }
+  }
+
+  /// Integration support accessor for cross-platform wrappers (e.g. React Native).
+  /// Returns the current runtime identity (session ID and device ID), or nil if not configured.
+  public static func getRuntimeContext() -> RuntimeContext? {
+    accessQueue.sync {
+      guard configured, let deviceInfo else {
+        return nil
+      }
+      return RuntimeContext(sessionID: sessionID, deviceID: deviceInfo.deviceID)
+    }
+  }
+
+  /// Staging method for React Native JS fatal crashes.
+  /// Stages a pending crash synchronously to disk so it can be uploaded on next launch or retry.
+  public static func stageReactNativeFatal(
+    crashId: String,
+    message: String,
+    errorType: String?,
+    stack: String?,
+    jsBreadcrumbsJson: String?
+  ) -> Bool {
+    let performStage = { () -> Bool in
+      guard configured, let handler = crashHandler else {
+        return false
+      }
+      return handler.stageFatal(
+        crashId: crashId,
+        message: message,
+        errorType: errorType,
+        stack: stack,
+        jsBreadcrumbsJson: jsBreadcrumbsJson
+      )
+    }
+
+    if DispatchQueue.getSpecific(key: accessQueueKey) != nil {
+      return performStage()
+    } else {
+      return accessQueue.sync(execute: performStage)
     }
   }
 
@@ -467,6 +540,7 @@ public enum Vestara {
       loggingEnabled = true
       autoRumEnabled = false
       UserDefaults.standard.removeObject(forKey: "com.vestara.queue.v1")
+      CrashHandler.resetSuppressionTokensForTest()
     }
   }
 

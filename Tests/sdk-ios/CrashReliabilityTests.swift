@@ -82,7 +82,7 @@ final class CrashReliabilityTests: XCTestCase {
       "session_id=\(UUID().uuidString)",
       "device_id=test-device-uuid",
       "environment=\(environment)",
-      "sdk_version=0.1.2",
+      "sdk_version=0.1.4",
       "app_version=1.0.0",
       "os_version=18.0",
       "device_model=iPhone",
@@ -1260,5 +1260,432 @@ final class CrashReliabilityTests: XCTestCase {
       expDelete.fulfill()
     }
     wait(for: [expDelete], timeout: 1.0)
+  }
+
+  func testRuntimeContextReturnsNilWhenUnconfigured() {
+    Vestara.resetForTesting()
+    XCTAssertNil(Vestara.getRuntimeContext())
+  }
+
+  func testRuntimeContextReturnsActiveIdentityWhenConfigured() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+    let ctx = Vestara.getRuntimeContext()
+    XCTAssertNotNil(ctx)
+    XCTAssertFalse(ctx!.sessionID.isEmpty)
+    XCTAssertFalse(ctx!.deviceID.isEmpty)
+  }
+
+  func testClearUserRemovesUserFromCrashContext() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+    Vestara.setUser(id: "user-123", email: "user@test.com")
+    _ = Vestara.getRuntimeContext()
+    Vestara.clearUser()
+
+    let exception = NSException(name: NSExceptionName("TestClearUserException"), reason: "Testing clear user", userInfo: nil)
+    CrashHandler.handleException(exception)
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 1)
+    let payload = pending[0].event["payload"] as? [String: Any]
+    XCTAssertNil(payload?["user"], "Old user id/email must be absent from crash payload after clearUser")
+  }
+
+  func testStageReactNativeFatalSuccess() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let crashId = "rn-crash-uuid-123"
+    let multilineStack = """
+    TypeError: null is not an object (evaluating 'foo.bar')
+        at evaluate (app.bundle:12:34)
+        at render (app.bundle:56:78)
+    """
+    let breadcrumbsJson = "[{\"category\":\"navigation\",\"message\":\"opened_screen\"}]"
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: crashId,
+      message: "TypeError: null is not an object (evaluating 'foo.bar')",
+      errorType: "TypeError",
+      stack: multilineStack,
+      jsBreadcrumbsJson: breadcrumbsJson
+    )
+
+    XCTAssertTrue(success)
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 1)
+
+    let event = pending[0].event
+    XCTAssertEqual(event["event_type"] as? String, "crash")
+
+    guard let payload = event["payload"] as? [String: Any] else {
+      XCTFail("Missing payload in staged crash event")
+      return
+    }
+
+    XCTAssertEqual(payload["origin"] as? String, "react_native_js")
+    XCTAssertEqual(payload["crash_id"] as? String, crashId)
+    XCTAssertEqual(payload["fatal"] as? Bool, true)
+    XCTAssertEqual(payload["handled"] as? Bool, false)
+    XCTAssertEqual(payload["exception_type"] as? String, "TypeError")
+    XCTAssertEqual(payload["message"] as? String, "TypeError: null is not an object (evaluating 'foo.bar')")
+
+    let stackTrace = payload["stack_trace"] as? [[String: Any]]
+    XCTAssertNotNil(stackTrace)
+    XCTAssertGreaterThanOrEqual(stackTrace?.count ?? 0, 1)
+
+    let breadcrumbs = payload["breadcrumbs"] as? [[String: Any]]
+    XCTAssertNotNil(breadcrumbs)
+    XCTAssertEqual(breadcrumbs?.count, 1)
+  }
+
+  func testStageReactNativeFatalWhenUnconfigured() {
+    Vestara.resetForTesting()
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-unconfigured",
+      message: "Unconfigured failure",
+      errorType: nil,
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertFalse(success)
+  }
+
+  func testStageReactNativeFatalBoundsAndMultilineEscaping() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let hugeMessage = String(repeating: "line with = sign\n", count: 800)
+    let hugeStack = String(repeating: "at foo (file.js:1:2)\n", count: 2000)
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-huge",
+      message: hugeMessage,
+      errorType: "LargeError",
+      stack: hugeStack,
+      jsBreadcrumbsJson: nil
+    )
+
+    XCTAssertTrue(success)
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 1)
+
+    let payload = pending[0].event["payload"] as? [String: Any]
+    XCTAssertEqual(payload?["origin"] as? String, "react_native_js")
+    XCTAssertEqual(payload?["crash_id"] as? String, "rn-crash-huge")
+
+    let message = payload?["message"] as? String
+    XCTAssertTrue(message?.contains("[truncated]") == true)
+    XCTAssertLessThanOrEqual(message?.count ?? 0, 8192 + 20)
+
+    let stackTrace = payload?["stack_trace"] as? [[String: Any]]
+    XCTAssertNotNil(stackTrace)
+    XCTAssertLessThanOrEqual(stackTrace?.count ?? 0, 50)
+  }
+
+  func testStageReactNativeFatalReversibleMessageAndMultilineStack() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let testMessage = "Error line 1\nError line 2 with literal \\n characters inside"
+    let testStack = "at onPress (index.js:10:5)\nat dispatch (redux.js:25:8)\nat handleClick (Button.js:30:12)"
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-reversible",
+      message: testMessage,
+      errorType: "CustomError",
+      stack: testStack,
+      jsBreadcrumbsJson: nil
+    )
+
+    XCTAssertTrue(success)
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 1)
+
+    guard let payload = pending[0].event["payload"] as? [String: Any] else {
+      XCTFail("Missing payload")
+      return
+    }
+
+    let recoveredMessage = payload["message"] as? String
+    XCTAssertEqual(recoveredMessage, testMessage, "Message containing both actual newline and literal \\n must be preserved exactly without conflation")
+
+    let stackTrace = payload["stack_trace"] as? [[String: Any]]
+    XCTAssertNotNil(stackTrace)
+    XCTAssertEqual(stackTrace?.count, 3, "Stack trace with 3 lines must reconstruct 3 distinct frames")
+    XCTAssertEqual(stackTrace?[0]["function"] as? String, "onPress")
+    XCTAssertEqual(stackTrace?[1]["function"] as? String, "dispatch")
+    XCTAssertEqual(stackTrace?[2]["function"] as? String, "handleClick")
+  }
+
+  func testStageReactNativeFatalBreadcrumbsBoundedTo16KB() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let smallBreadcrumbs = "[{\"category\":\"ui\",\"message\":\"click\"}]"
+    let successSmall = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-crumbs-small",
+      message: "Small crumbs error",
+      errorType: "Error",
+      stack: nil,
+      jsBreadcrumbsJson: smallBreadcrumbs
+    )
+    XCTAssertTrue(successSmall)
+
+    let singleCrumb = "{\"category\":\"ui\",\"message\":\"\(String(repeating: "c", count: 500))\"}"
+    let hugeBreadcrumbs = "[" + (1...40).map { _ in singleCrumb }.joined(separator: ",") + "]"
+    XCTAssertGreaterThan(hugeBreadcrumbs.utf8.count, 16 * 1024, "Test setup: huge breadcrumbs must exceed 16 KB")
+
+    let successHuge = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-crumbs-huge",
+      message: "Huge crumbs error",
+      errorType: "Error",
+      stack: nil,
+      jsBreadcrumbsJson: hugeBreadcrumbs
+    )
+    XCTAssertTrue(successHuge)
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 2)
+
+    let smallEvent = pending.first { (($0.event["payload"] as? [String: Any])?["crash_id"] as? String) == "rn-crash-crumbs-small" }
+    let smallPayload = smallEvent?.event["payload"] as? [String: Any]
+    XCTAssertNotNil(smallPayload?["breadcrumbs"], "Breadcrumbs <= 16 KB must be persisted")
+
+    let hugeEvent = pending.first { (($0.event["payload"] as? [String: Any])?["crash_id"] as? String) == "rn-crash-crumbs-huge" }
+    let hugePayload = hugeEvent?.event["payload"] as? [String: Any]
+    XCTAssertNil(hugePayload?["breadcrumbs"], "Breadcrumbs > 16 KB must be omitted")
+  }
+
+  // MARK: - RN-2D: Duplicate Suppression Tests
+
+  func testStageReactNativeFatalArmsExceptionSuppressionTokenOnly() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    XCTAssertFalse(CrashHandler.isFatalExceptionSuppressionArmedForTest())
+    XCTAssertFalse(CrashHandler.isSignalSuppressionArmedForTest())
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-suppression-seq",
+      message: "Fatal JS crash",
+      errorType: "TypeError",
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertTrue(success)
+    XCTAssertTrue(CrashHandler.isFatalExceptionSuppressionArmedForTest(), "Stage success must arm ONLY the fatal exception token")
+    XCTAssertFalse(CrashHandler.isSignalSuppressionArmedForTest(), "SIGABRT token must remain disarmed until exception is handled")
+  }
+
+  func testExpectedRCTFatalExceptionSuppressesPersistenceAndArmsSignalToken() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-suppressed-id",
+      message: "Fatal JS crash",
+      errorType: "TypeError",
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertTrue(success)
+
+    let rctException = NSException(
+      name: NSExceptionName("RCTFatalException: Unhandled JS Exception: Fatal JS crash"),
+      reason: "Fatal JS crash",
+      userInfo: nil
+    )
+
+    XCTAssertTrue(CrashHandler.isFatalExceptionSuppressionArmedForTest(), "Exception token must be armed prior to handleException")
+    XCTAssertFalse(CrashHandler.isSignalSuppressionArmedForTest(), "Signal token must not be armed yet")
+
+    CrashHandler.handleException(rctException)
+
+    XCTAssertFalse(CrashHandler.isFatalExceptionSuppressionArmedForTest(), "Exception token must be consumed")
+    XCTAssertTrue(CrashHandler.isSignalSuppressionArmedForTest(), "SIGABRT token must now be armed for imminent abort()")
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 1, "Only the staged react_native_js crash file must exist")
+    let payload = pending[0].event["payload"] as? [String: Any]
+    XCTAssertEqual(payload?["origin"] as? String, "react_native_js")
+    XCTAssertEqual(payload?["crash_id"] as? String, "rn-crash-suppressed-id")
+
+    let sigabrtSuppressed = CrashHandler.consumeSignalSuppression(SIGABRT)
+    XCTAssertTrue(sigabrtSuppressed, "Expected SIGABRT following suppressed RCTFatalException must be suppressed")
+    XCTAssertFalse(CrashHandler.isSignalSuppressionArmedForTest(), "SIGABRT token must be consumed once")
+  }
+
+  func testStageFailureDoesNotArmSuppressionToken() {
+    Vestara.resetForTesting()
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-unconfigured",
+      message: "Error",
+      errorType: "Error",
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertFalse(success)
+    XCTAssertFalse(CrashHandler.isFatalExceptionSuppressionArmedForTest())
+    XCTAssertFalse(CrashHandler.isSignalSuppressionArmedForTest())
+
+    let rctException = NSException(
+      name: NSExceptionName("RCTFatalException: Error"),
+      reason: "Error",
+      userInfo: nil
+    )
+    XCTAssertFalse(CrashHandler.handleExceptionSuppression(rctException), "Exception must not be suppressed when staging failed")
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGABRT), "SIGABRT must not be suppressed when staging failed")
+  }
+
+  func testArmedExceptionTokenDoesNotSuppressUnrelatedNSException() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-unrelated-test",
+      message: "Fatal JS crash",
+      errorType: "TypeError",
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertTrue(success)
+
+    let unrelatedException = NSException(
+      name: NSExceptionName("NSInvalidArgumentException"),
+      reason: "unrecognized selector sent to instance",
+      userInfo: nil
+    )
+
+    let suppressed = CrashHandler.handleExceptionSuppression(unrelatedException)
+    XCTAssertFalse(suppressed, "Unrelated NSException must not be suppressed")
+    XCTAssertTrue(CrashHandler.isFatalExceptionSuppressionArmedForTest(), "Token must remain armed when unrelated exception occurs")
+    XCTAssertFalse(CrashHandler.isSignalSuppressionArmedForTest(), "Signal token must NOT be armed by unrelated exception")
+
+    CrashHandler.handleException(unrelatedException)
+
+    let pending = CrashHandler().loadPendingCrashes()
+    XCTAssertEqual(pending.count, 2, "Both staged RN crash and unrelated native exception must exist")
+    let exceptionCrash = pending.first { ($0.event["payload"] as? [String: Any])?["exception_type"] as? String == "NSInvalidArgumentException" }
+    XCTAssertNotNil(exceptionCrash)
+  }
+
+  func testSignalSuppressionDoesNotSuppressNonSigabrtSignals() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-signal-test",
+      message: "Fatal JS crash",
+      errorType: "TypeError",
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertTrue(success)
+
+    let rctException = NSException(
+      name: NSExceptionName("RCTFatalException: test"),
+      reason: "test",
+      userInfo: nil
+    )
+    XCTAssertTrue(CrashHandler.handleExceptionSuppression(rctException))
+    XCTAssertTrue(CrashHandler.isSignalSuppressionArmedForTest())
+
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGSEGV), "SIGSEGV must never be suppressed")
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGBUS), "SIGBUS must never be suppressed")
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGILL), "SIGILL must never be suppressed")
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGFPE), "SIGFPE must never be suppressed")
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGTRAP), "SIGTRAP must never be suppressed")
+    XCTAssertTrue(CrashHandler.isSignalSuppressionArmedForTest(), "Signal token must remain intact for expected SIGABRT")
+  }
+
+  func testOneShotTokensAreConsumedAndDoNotSuppressSecondEvent() {
+    Vestara.resetForTesting()
+    Vestara.configure(
+      token: "test-token",
+      apiURL: dummyAPIURL,
+      environment: "production",
+      autoRum: false
+    )
+
+    let success = Vestara.stageReactNativeFatal(
+      crashId: "rn-crash-oneshot-test",
+      message: "Fatal JS crash",
+      errorType: "TypeError",
+      stack: nil,
+      jsBreadcrumbsJson: nil
+    )
+    XCTAssertTrue(success)
+
+    let rctException = NSException(
+      name: NSExceptionName("RCTFatalException: first"),
+      reason: "first",
+      userInfo: nil
+    )
+    XCTAssertTrue(CrashHandler.handleExceptionSuppression(rctException))
+
+    let secondException = NSException(
+      name: NSExceptionName("RCTFatalException: second"),
+      reason: "second",
+      userInfo: nil
+    )
+    XCTAssertFalse(CrashHandler.handleExceptionSuppression(secondException), "Second RCTFatalException must not be suppressed without new stage")
+
+    XCTAssertTrue(CrashHandler.consumeSignalSuppression(SIGABRT))
+    XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGABRT), "Second SIGABRT must not be suppressed without new stage")
   }
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4
+
+- Added React Native native-runtime integration support.
+- Added durable React Native fatal JS crash staging.
+- Added deterministic duplicate crash suppression for React Native fatal exceptions and signals.
+- Improved crash and user context synchronization.
+- Renamed `LogFlow.swift` to `Vestara.swift`.
+- Added internal C signal-safety helper for atomic suppression state.
+
 ## 0.1.3
 
 - Fixed persisted crash reports becoming stranded after transient upload failures.

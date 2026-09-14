@@ -23,7 +23,7 @@ public struct RuntimeContext: Equatable {
 }
 
 public enum Vestara {
-  private static let sdkVersion = "0.1.4"
+  private static let sdkVersion = "0.1.5"
   private static let defaultAPIURL = URL(string: "https://api.vestara.dev")!
   private static let accessQueueKey = DispatchSpecificKey<Void>()
   private static let accessQueue: DispatchQueue = {
@@ -66,6 +66,58 @@ public enum Vestara {
     }
   }
 
+  public enum TransportSecurityError: Error, Equatable, CustomStringConvertible {
+    case invalidURL(String)
+    case unsupportedScheme(String)
+    case insecureRemoteHTTP(String)
+
+    public var description: String {
+      switch self {
+      case .invalidURL(let raw):
+        return "Invalid apiUrl \"\(raw)\". Must be a valid absolute URL."
+      case .unsupportedScheme(let scheme):
+        return "Unsupported protocol \"\(scheme)\". Telemetry endpoints must use HTTPS."
+      case .insecureRemoteHTTP(let raw):
+        return "Insecure HTTP telemetry endpoint \"\(raw)\" rejected. Remote endpoints must use HTTPS."
+      }
+    }
+  }
+
+  public static var isConfigured: Bool {
+    accessQueue.sync { configured }
+  }
+
+  @discardableResult
+  public static func validateAPIURL(_ url: URL?) throws -> URL {
+    let candidate = url ?? defaultAPIURL
+    guard let scheme = candidate.scheme?.lowercased(), !scheme.isEmpty,
+          let host = candidate.host?.lowercased(), !host.isEmpty else {
+      throw TransportSecurityError.invalidURL(candidate.absoluteString)
+    }
+
+    guard scheme == "https" || scheme == "http" else {
+      throw TransportSecurityError.unsupportedScheme(candidate.scheme ?? "")
+    }
+
+    if scheme == "http" {
+      let isAllowedLoopback = host == "localhost" || host == "127.0.0.1"
+      if !isAllowedLoopback {
+        throw TransportSecurityError.insecureRemoteHTTP(candidate.absoluteString)
+      }
+    }
+
+    return candidate
+  }
+
+  @discardableResult
+  public static func validateAPIURLString(_ string: String) throws -> URL {
+    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, let url = URL(string: trimmed) else {
+      throw TransportSecurityError.invalidURL(string)
+    }
+    return try validateAPIURL(url)
+  }
+
   public static func configure(
     token: String,
     apiURL: URL? = nil,
@@ -100,6 +152,14 @@ public enum Vestara {
     beforeSend: (([String: Any]) throws -> [String: Any]?)? = nil,
     session: URLSession? = nil
   ) {
+    let validatedURL: URL
+    do {
+      validatedURL = try validateAPIURL(apiURL)
+    } catch {
+      NSLog("Vestara SDK: %@", "\(error)")
+      return
+    }
+
     let normalizedEnvironment = normalizeEnvironment(environment)
     accessQueue.sync {
       guard !token.isEmpty else {
@@ -113,7 +173,7 @@ public enum Vestara {
       let nextUploader = Uploader(
         queue: nextQueue,
         token: token,
-        apiURL: apiURL ?? defaultAPIURL,
+        apiURL: validatedURL,
         crashHandler: nextCrashHandler,
         beforeSend: beforeSend,
         session: session

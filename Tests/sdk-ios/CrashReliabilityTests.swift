@@ -82,7 +82,7 @@ final class CrashReliabilityTests: XCTestCase {
       "session_id=\(UUID().uuidString)",
       "device_id=test-device-uuid",
       "environment=\(environment)",
-      "sdk_version=0.1.4",
+      "sdk_version=0.1.5",
       "app_version=1.0.0",
       "os_version=18.0",
       "device_model=iPhone",
@@ -1687,5 +1687,86 @@ final class CrashReliabilityTests: XCTestCase {
 
     XCTAssertTrue(CrashHandler.consumeSignalSuppression(SIGABRT))
     XCTAssertFalse(CrashHandler.consumeSignalSuppression(SIGABRT), "Second SIGABRT must not be suppressed without new stage")
+  }
+
+  // MARK: - Transport Security Tests
+
+  func testTransportSecurityAcceptsValidProductionAndCustomHTTPS() throws {
+    let validHTTPS = [
+      "https://api.vestara.dev",
+      "https://api.vestara.dev/",
+      "https://custom.example.com:8443",
+      "https://custom.example.com:8443/api"
+    ]
+    for urlStr in validHTTPS {
+      let validated = try Vestara.validateAPIURLString(urlStr)
+      XCTAssertEqual(validated.scheme?.lowercased(), "https")
+    }
+    let defaultURL = try Vestara.validateAPIURL(nil)
+    XCTAssertEqual(defaultURL.absoluteString, "https://api.vestara.dev")
+  }
+
+  func testTransportSecurityAcceptsApprovedLocalLoopbackHTTP() throws {
+    let validLoopbacks = [
+      "http://localhost:3000",
+      "http://127.0.0.1:9999",
+      "http://LOCALHOST:8080"
+    ]
+    for urlStr in validLoopbacks {
+      let validated = try Vestara.validateAPIURLString(urlStr)
+      XCTAssertEqual(validated.scheme?.lowercased(), "http")
+    }
+  }
+
+  func testTransportSecurityRejectsAndroidEmulatorHostOnIOS() {
+    XCTAssertThrowsError(try Vestara.validateAPIURLString("http://10.0.2.2:8000")) { error in
+      XCTAssertEqual(error as? Vestara.TransportSecurityError, .insecureRemoteHTTP("http://10.0.2.2:8000"))
+    }
+  }
+
+  func testTransportSecurityRejectsRemoteHTTP() {
+    let insecureEndpoints = [
+      "http://example.com",
+      "http://api.vestara.dev",
+      "http://192.168.1.50:3000",
+      "http://10.0.0.1:8080",
+      "http://172.20.0.5:8000",
+      "http://localhost.example.com",
+      "http://127.0.0.1.example.com"
+    ]
+    for urlStr in insecureEndpoints {
+      XCTAssertThrowsError(try Vestara.validateAPIURLString(urlStr), "Expected \(urlStr) to be rejected") { error in
+        XCTAssertEqual(error as? Vestara.TransportSecurityError, .insecureRemoteHTTP(urlStr))
+      }
+    }
+  }
+
+  func testTransportSecurityRejectsMalformedAndNonHTTPSchemes() {
+    let malformedEndpoints = [
+      "not-a-url",
+      "/api",
+      "api.vestara.dev",
+      "https:",
+      "https://",
+      "ftp://example.com",
+      "file:///tmp/foo"
+    ]
+    for urlStr in malformedEndpoints {
+      XCTAssertThrowsError(try Vestara.validateAPIURLString(urlStr), "Expected \(urlStr) to be rejected")
+    }
+  }
+
+  func testTransportSecurityConfigureFailsFastOnInsecureURL() {
+    Vestara.resetForTesting()
+    XCTAssertFalse(Vestara.isConfigured)
+
+    Vestara.configure(
+      token: "test-token",
+      apiURL: URL(string: "http://insecure-remote.com"),
+      environment: "production"
+    )
+
+    XCTAssertFalse(Vestara.isConfigured, "Vestara must not configure when apiUrl is insecure")
+    XCTAssertNil(Vestara.getRuntimeContext(), "Runtime context must remain nil when unconfigured")
   }
 }
